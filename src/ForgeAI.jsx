@@ -15,7 +15,8 @@ import {
 const FONT_IMPORT =
   "@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap');";
 
-const MODEL = "claude-sonnet-4-6";
+// Model selection now lives entirely server-side (GEMINI_MODEL env var on
+// the backend) — this frontend no longer needs to know or send a model name.
 
 // Reads the Vercel build-time env var if set (Project Settings -> Environment
 // Variables -> VITE_API_BASE_URL), otherwise falls back to the hardcoded
@@ -49,12 +50,73 @@ const STEP_DEFS = [
   { key: "validation", label: "Validation" },
 ];
 
+// ------------------------------------------------------------------
+// Asset Research & ID Resolution — status vocabulary
+// ------------------------------------------------------------------
+// VERIFIED / FOUND_UNVERIFIED are only ever set by a real lookup — nothing
+// in this generation pipeline has a live Roblox Creator Store search wired
+// in yet, so the generator itself will only ever produce PROCEDURAL,
+// MISSING_ASSET, or OPTIONAL_MISSING honestly. The other two statuses exist
+// in the vocabulary for when a real search step is added, and for assets a
+// person confirms manually via chat.
+const ASSET_STATUS = {
+  VERIFIED: "VERIFIED",
+  FOUND_UNVERIFIED: "FOUND_UNVERIFIED",
+  MISSING_ASSET: "MISSING_ASSET",
+  PROCEDURAL: "PROCEDURAL",
+  OPTIONAL_MISSING: "OPTIONAL_MISSING",
+  INVALID: "INVALID",
+};
+
+// Deterministic, non-LLM-dependent safety net. The model is instructed never
+// to write placeholder-looking asset references, but instructions can be
+// missed — this regex scan is what actually blocks a fake ID from reaching
+// Send to Roblox Studio, independent of whether the model behaved.
+const PLACEHOLDER_PATTERNS = [
+  /YOUR_ASSET_ID_HERE/i,
+  /YOUR_ANIMATION_ID_HERE/i,
+  /rbxassetid:\/\/0+(?!\d)/i,
+  /rbxassetid:\/\/YOUR_/i,
+  /\bPLACEHOLDER[_A-Z]*\b/i,
+];
+
+function findPlaceholderIssues(files) {
+  const issues = [];
+  for (const f of files || []) {
+    const codeVal = f.code ?? f.source;
+    if (typeof codeVal === "string") {
+      for (const pat of PLACEHOLDER_PATTERNS) {
+        if (pat.test(codeVal)) {
+          issues.push({ path: f.path, name: f.name, field: "code", pattern: String(pat) });
+          break;
+        }
+      }
+    }
+    if (f.properties && typeof f.properties === "object") {
+      for (const [key, val] of Object.entries(f.properties)) {
+        if (typeof val === "string") {
+          for (const pat of PLACEHOLDER_PATTERNS) {
+            if (pat.test(val)) {
+              issues.push({ path: f.path, name: f.name, field: `properties.${key}`, pattern: String(pat) });
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+  return issues;
+}
+
 const SYSTEM_PROMPT = `Tu es le moteur de génération de FORGE AI, un copilote de développement Roblox Studio spécialisé en Luau.
 
 RÈGLES STRICTES :
 - Le code doit être compilable dans Roblox Studio (Luau), propre, commenté, modulaire.
 - JAMAIS de dégâts, cooldowns critiques ou récompenses validés uniquement côté client : la logique sensible vit dans ServerScriptService et est validée serveur.
-- JAMAIS d'AssetId Roblox inventé. Utilise exactement le texte YOUR_ASSET_ID_HERE pour les sons et YOUR_ANIMATION_ID_HERE pour les animations.
+- GESTION DES ASSETS (animations, sons, meshes, textures) — INTERDICTION ABSOLUE d'écrire un Asset ID inventé OU un texte placeholder (comme "YOUR_ASSET_ID_HERE") dans le champ "code" ou dans "properties" d'un fichier. Ni faux ID, ni texte qui y ressemble.
+  - Si l'élément peut être créé procéduralement avec des Instances Roblox natives (ParticleEmitter, Beam, Trail, Attachment, Highlight, PointLight) : crée-le directement, sans aucun ID externe requis, et déclare-le dans "assets" avec status "PROCEDURAL" et assetId null.
+  - Si l'élément nécessite un vrai Asset ID externe (son, AnimationId, mesh, texture) que tu n'as pas et ne peux pas vérifier : NE WRITE AUCUNE valeur dans le champ d'ID de la propriété (laisse-la absente ou chaîne vide ""), et déclare l'asset dans "assets" avec status "MISSING_ASSET", assetId null. Le code doit quand même créer l'Instance (Sound, Animation, etc.) — juste sans ID injecté.
+  - N'attribue JAMAIS toi-même le statut "VERIFIED" ou "FOUND_UNVERIFIED" : tu n'as pas de moyen de vérifier un asset réel dans cet environnement. Utilise uniquement "PROCEDURAL", "MISSING_ASSET", ou "OPTIONAL_MISSING" (pour un élément cosmétique facultatif absent).
 - Architecture cible :
   ReplicatedStorage/Remotes, ReplicatedStorage/Modules, ReplicatedStorage/Shared
   ServerScriptService/Combat, ServerScriptService/Abilities, ServerScriptService/Services
@@ -67,11 +129,17 @@ RÈGLES STRICTES :
 /*  The Claude artifact preview has a built-in proxy to api.anthropic. */
 /*  com that needs no API key. That proxy does NOT exist once this app */
 /*  runs outside claude.ai, so this build calls YOUR OWN backend       */
-/*  instead (POST /generate), which holds the real Anthropic key       */
-/*  server-side and forwards the request. Configure the backend URL    */
-/*  in Settings before using AI Builder.                                */
+/*  instead (POST /generate), which forwards to Gemini using your own  */
+/*  GEMINI_API_KEY server-side. Configure the backend URL in Settings   */
+/*  before using AI Builder.                                            */
 /* ------------------------------------------------------------------ */
 let AI_BACKEND_URL = ""; // kept in sync with the backendUrl app state, see ForgeAI()
+
+// No longer capped at 1000 — that limit was specific to the Claude artifact
+// preview's built-in proxy. This build talks to its own backend with its
+// own API key, so it can use a realistic budget and avoid most truncation-
+// driven "non-JSON response" failures outright.
+const MAX_OUTPUT_TOKENS = 4096;
 
 async function rawClaudeCall(messages) {
   if (!AI_BACKEND_URL) {
@@ -82,8 +150,7 @@ async function rawClaudeCall(messages) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 1000,
+      max_tokens: MAX_OUTPUT_TOKENS,
       system: SYSTEM_PROMPT,
       messages,
     }),
@@ -242,8 +309,15 @@ async function fetchBackend(url, options = {}, { retries = 2, onRetry } = {}) {
           continue;
         }
         const text = await res.text().catch(() => "");
-        const err = new Error(`Le backend a répondu avec une erreur HTTP ${res.status}${text ? ` — ${text.slice(0, 200)}` : ""}`);
+        let parsedBody = null;
+        try { parsedBody = text ? JSON.parse(text) : null; } catch (_) {}
+        const err = new Error(
+          parsedBody?.message
+            ? `${parsedBody.message}`
+            : `Le backend a répondu avec une erreur HTTP ${res.status}${text ? ` — ${text.slice(0, 200)}` : ""}`
+        );
         err.httpStatus = res.status;
+        err.body = parsedBody;
         throw err;
       }
       return res;
@@ -296,6 +370,18 @@ async function backendSendBuild(backendUrl, code, systemName, files, projectId, 
 async function backendBuildHistory(backendUrl, code) {
   const base = normalizeBackend(backendUrl);
   const res = await fetchBackend(`${base}/studio/builds/${code}`);
+  return res.json();
+}
+
+// Calls the Asset Resolution Engine (project cache -> GitHub -> web search).
+// Never returns a fabricated assetId — see server/assetResolution.js.
+async function backendResolveAsset(backendUrl, { name, type, searchTerm, description, existingAssets }, onRetry) {
+  const base = normalizeBackend(backendUrl);
+  const res = await fetchBackend(`${base}/assets/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, type, searchTerm, description, existingAssets }),
+  }, { onRetry });
   return res.json();
 }
 
@@ -752,6 +838,7 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
   const [chatBusy, setChatBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const [buildResult, setBuildResult] = useState(null); // { status, error, fileCount, id }
+  const [blockedAssets, setBlockedAssets] = useState(null); // placeholder issues blocking send
   const chatEndRef = useRef(null);
 
   async function sendToStudio() {
@@ -760,6 +847,18 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
       showToast("Configure d'abord l'URL du backend dans la page Roblox Studio.", "error");
       return;
     }
+
+    // Hard safety gate: never send a placeholder-looking Asset ID to Roblox
+    // Studio, regardless of what the model claimed. Deterministic, not
+    // dependent on the LLM having followed instructions correctly.
+    const placeholderIssues = findPlaceholderIssues(project.system.files);
+    if (placeholderIssues.length) {
+      setBlockedAssets(placeholderIssues);
+      showToast(`🔴 Envoi bloqué : ${placeholderIssues.length} référence(s) d'asset placeholder détectée(s). Corrige-les d'abord (voir détail ci-dessous).`, "error");
+      return;
+    }
+    setBlockedAssets(null);
+
     setSending(true);
     setBuildResult(null);
     try {
@@ -789,8 +888,13 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         if (attempts >= 10) clearInterval(poll); // ~30s ceiling
       }, 3000);
     } catch (e) {
-      const detail = e.httpStatus ? `HTTP ${e.httpStatus} — vérifie les logs Render` : e.message;
-      showToast(`Échec de l'envoi : ${detail}`, "error");
+      if (e.body?.code === "PLACEHOLDER_ASSET_ID" && Array.isArray(e.body.detail)) {
+        setBlockedAssets(e.body.detail);
+        showToast("🔴 Le backend a refusé le build : référence(s) d'asset placeholder détectée(s).", "error");
+      } else {
+        const detail = e.httpStatus ? `HTTP ${e.httpStatus} — vérifie les logs Render` : e.message;
+        showToast(`Échec de l'envoi : ${detail}`, "error");
+      }
     } finally {
       setSending(false);
     }
@@ -832,12 +936,19 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
   async function runArchitecture() {
     setBusy(true); setBusyStep("architecture");
     try {
-      const schema = `{"system_name": "...", "summary": "...", "files": [{"path":"...", "type":"Script|LocalScript|ModuleScript|Folder|RemoteEvent|RemoteFunction", "name":"...", "code":"..."}], "abilities": [{"name":"...", "description":"...", "keybind":"...", "cooldown":0, "damage":0, "range":0}], "warnings": ["..."]}`;
+      const schema = `{"system_name": "...", "summary": "...", "files": [{"path":"...", "type":"Script|LocalScript|ModuleScript|Folder|RemoteEvent|RemoteFunction", "name":"...", "code":"..."}], "abilities": [{"name":"...", "description":"...", "keybind":"...", "cooldown":0, "damage":0, "range":0}], "assets": [{"name":"...", "type":"animation|sfx|vfx|mesh|texture", "status":"PROCEDURAL|MISSING_ASSET|OPTIONAL_MISSING", "assetId": null}], "warnings": ["..."]}`;
       const analysisCtx = project.steps?.analysis?.output ? `Analyse préalable : ${project.steps.analysis.output}\n\n` : "";
       const result = await callClaude([{
         role: "user",
-        content: `${analysisCtx}Demande : "${prompt}"\n\nGénère l'architecture Roblox de base et UN SEUL fichier Luau court (20-30 lignes max) mais réellement fonctionnel et prioritaire (le plus important pour cette mécanique). Commentaires brefs. Réponds STRICTEMENT avec ce schéma JSON, sans aucun texte autour, JSON complet et valide obligatoire :\n${schema}\n\nTu pourras ajouter d'autres fichiers ensuite via les étapes suivantes ou le chat.`,
+        content: `${analysisCtx}Demande : "${prompt}"\n\nGénère l'architecture Roblox de base et UN SEUL fichier Luau court (20-30 lignes max) mais réellement fonctionnel et prioritaire (le plus important pour cette mécanique). Commentaires brefs. Réponds STRICTEMENT avec ce schéma JSON, sans aucun texte autour, JSON complet et valide obligatoire :\n${schema}\n\nTu pourras ajouter d'autres fichiers ensuite via les étapes suivantes ou le chat. Rappel : jamais de faux Asset ID ni de texte placeholder dans "code".`,
       }]);
+      const placeholderIssues = findPlaceholderIssues(result.files);
+      if (placeholderIssues.length) {
+        result.validation = {
+          errors: placeholderIssues.map((i) => `PLACEHOLDER_ASSET_ID: ${i.path}/${i.name} (${i.field}) contient une référence d'asset placeholder — corrige avant d'envoyer à Roblox Studio.`),
+          warnings: [], suggestions: [],
+        };
+      }
       update((p) => ({
         system: result,
         steps: { ...p.steps, architecture: { status: "done" } },
@@ -856,16 +967,16 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
     if (!project.system) { showToast("Génère d'abord l'architecture.", "error"); return; }
     setBusy(true); setBusyStep(stepKey);
     const instructions = {
-      vfx: `Ajoute UN SEUL fichier ModuleScript VFX court (ParticleEmitter/Beam/Trail configurés, synchronisé avec les événements de gameplay). Réponds en JSON: {"new_files":[{...}], "vfx":["..."]}`,
-      sfx: `Ajoute UN SEUL fichier de configuration SFX court (Sound objects avec YOUR_ASSET_ID_HERE). Réponds en JSON: {"new_files":[{...}], "sfx":["..."]}`,
-      animations: `Ajoute UN SEUL fichier court regroupant les Animation objects nécessaires (avec YOUR_ANIMATION_ID_HERE) et leur lecture. Réponds en JSON: {"new_files":[{...}], "animations":["..."]}`,
-      validation: `Relis les fichiers existants (résumé fourni) et retourne une validation courte (3-5 points max par catégorie). Réponds en JSON: {"errors":["..."], "warnings":["..."], "suggestions":["..."]}`,
+      vfx: `Ajoute UN SEUL fichier ModuleScript VFX court (ParticleEmitter/Beam/Trail configurés, synchronisé avec les événements de gameplay — priorise le procédural, aucun asset externe requis normalement). Réponds en JSON: {"new_files":[{...}], "vfx":["..."], "assets":[{"name":"...","type":"vfx","status":"PROCEDURAL|MISSING_ASSET|OPTIONAL_MISSING","assetId":null}]}`,
+      sfx: `Ajoute UN SEUL fichier de configuration SFX court (des objets Sound, SANS assigner de SoundId — laisse-le absent/vide, chaque son nécessitant un vrai asset externe doit être déclaré dans "assets" avec status MISSING_ASSET). Réponds en JSON: {"new_files":[{...}], "sfx":["..."], "assets":[{"name":"...","type":"sfx","status":"MISSING_ASSET|OPTIONAL_MISSING","assetId":null}]}`,
+      animations: `Ajoute UN SEUL fichier court regroupant les Animation objects nécessaires (SANS assigner d'AnimationId — laisse-le absent/vide) et leur lecture, plus une déclaration "assets" pour chaque animation avec status MISSING_ASSET puisqu'aucun ID vérifié n'est disponible. Réponds en JSON: {"new_files":[{...}], "animations":["..."], "assets":[{"name":"...","type":"animation","status":"MISSING_ASSET|OPTIONAL_MISSING","assetId":null}]}`,
+      validation: `Relis les fichiers existants (résumé fourni) et retourne une validation courte (3-5 points max par catégorie), en signalant explicitement tout Asset ID suspect/inventé que tu repérerais. Réponds en JSON: {"errors":["..."], "warnings":["..."], "suggestions":["..."]}`,
     };
     try {
       const filesSummary = project.system.files.map((f) => `${f.path}/${f.name} (${f.type})`).join(", ");
       const result = await callClaude([{
         role: "user",
-        content: `Système : "${project.system.system_name}". Demande initiale : "${prompt}". Fichiers existants : ${filesSummary}.\n\n${instructions[stepKey]}\n\nSois extrêmement concis. Code réellement fonctionnel uniquement, JSON complet et valide.`,
+        content: `Système : "${project.system.system_name}". Demande initiale : "${prompt}". Fichiers existants : ${filesSummary}.\n\n${instructions[stepKey]}\n\nSois extrêmement concis. Code réellement fonctionnel uniquement, JSON complet et valide. Rappel : jamais de faux Asset ID ni de texte placeholder dans "code" ou "properties".`,
       }]);
 
       update((p) => {
@@ -874,9 +985,26 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         if (result.vfx) sys.vfx = [...(sys.vfx || []), ...result.vfx];
         if (result.sfx) sys.sfx = [...(sys.sfx || []), ...result.sfx];
         if (result.animations) sys.animations = [...(sys.animations || []), ...result.animations];
-        if (result.errors || result.warnings || result.suggestions) {
-          sys.validation = { errors: result.errors || [], warnings: result.warnings || [], suggestions: result.suggestions || [] };
+        if (result.assets) sys.assets = [...(sys.assets || []), ...result.assets];
+
+        // Deterministic safety net: scan every file (old + new) for
+        // placeholder-looking asset references regardless of what the
+        // model claims — this is what actually enforces the no-fake-ID rule.
+        const placeholderIssues = findPlaceholderIssues(sys.files);
+        const llmErrors = result.errors || [];
+        const llmWarnings = result.warnings || [];
+        const llmSuggestions = result.suggestions || [];
+        if (llmErrors.length || llmWarnings.length || llmSuggestions.length || placeholderIssues.length) {
+          sys.validation = {
+            errors: [
+              ...llmErrors,
+              ...placeholderIssues.map((i) => `PLACEHOLDER_ASSET_ID: ${i.path}/${i.name} (${i.field}) contient une référence d'asset placeholder — corrige avant d'envoyer à Roblox Studio.`),
+            ],
+            warnings: llmWarnings,
+            suggestions: llmSuggestions,
+          };
         }
+
         return {
           system: sys,
           steps: { ...p.steps, [stepKey]: { status: "done" } },
@@ -911,9 +1039,26 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
           if (idx >= 0) files[idx] = uf; else files.push(uf);
         });
         (result.new_files || []).forEach((nf) => files.push(nf));
+
+        const placeholderIssues = findPlaceholderIssues(files);
+        const sys = { ...p.system, files };
+        if (placeholderIssues.length) {
+          sys.validation = {
+            ...(p.system.validation || { warnings: [], suggestions: [] }),
+            errors: [
+              ...((p.system.validation && p.system.validation.errors) || []),
+              ...placeholderIssues.map((i) => `PLACEHOLDER_ASSET_ID: ${i.path}/${i.name} (${i.field}) contient une référence d'asset placeholder — corrige avant d'envoyer à Roblox Studio.`),
+            ],
+          };
+        }
+
         return {
-          system: { ...p.system, files },
-          chat: [...(p.chat || []), { role: "assistant", text: result.reply || "Modifications appliquées.", id: uid() }],
+          system: sys,
+          chat: [...(p.chat || []), {
+            role: "assistant",
+            text: (result.reply || "Modifications appliquées.") + (placeholderIssues.length ? " ⚠️ Un Asset ID placeholder a été détecté et signalé dans la validation — corrige-le avant d'envoyer à Roblox Studio." : ""),
+            id: uid(),
+          }],
         };
       });
     } catch (e) {
@@ -994,6 +1139,33 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
               {sending ? <Loader2 size={14} className="spin" /> : <Link2 size={14} />} SEND TO ROBLOX STUDIO
             </button>
           </div>
+
+          {blockedAssets && (
+            <div className="card" style={{ padding: 14, marginTop: 10, borderColor: "#3a2020" }}>
+              <div style={{ display: "flex", gap: 10 }}>
+                <ShieldAlert size={16} color="var(--danger)" style={{ flexShrink: 0, marginTop: 1 }} />
+                <div style={{ fontSize: 12.5, lineHeight: 1.7 }}>
+                  <strong style={{ color: "var(--danger)" }}>Envoi bloqué — référence(s) d'asset placeholder détectée(s) :</strong>
+                  <ul style={{ margin: "6px 0 0", paddingLeft: 18, color: "var(--muted)" }}>
+                    {blockedAssets.map((i, idx) => (
+                      <li key={idx}><span className="fmono">{i.path}/{i.name}</span> — champ <span className="fmono">{i.field}</span></li>
+                    ))}
+                  </ul>
+                  <div style={{ marginTop: 6, color: "var(--muted)" }}>Corrige via le chat ci-dessous (ex: "remplace l'ID de {blockedAssets[0]?.name} par un asset réel") ou régénère l'étape concernée, puis renvoie.</div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {project.system.assets?.some((a) => a.status === "MISSING_ASSET") && !blockedAssets && (
+            <div className="card" style={{ padding: 12, marginTop: 10, borderColor: "#3a3020" }}>
+              <div style={{ display: "flex", gap: 8, fontSize: 12, color: "var(--muted)", alignItems: "flex-start" }}>
+                <AlertTriangle size={14} color="var(--ember2)" style={{ flexShrink: 0, marginTop: 1 }} />
+                <span>{project.system.assets.filter((a) => a.status === "MISSING_ASSET").length} asset(s) sans ID vérifié (voir manifeste ci-dessous) — les instances seront créées mais incomplètes (pas de son/animation) tant que tu n'auras pas fourni un vrai Asset ID. L'envoi reste autorisé.</span>
+              </div>
+            </div>
+          )}
+
           {buildResult && (
             <div style={{ marginTop: 10, display: "flex", justifyContent: "flex-end" }}>
               <div className="card" style={{ padding: "10px 14px", fontSize: 12.5, display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
@@ -1007,7 +1179,22 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         </div>
       )}
 
-      {project.system && <GeneratedSystemPanel system={project.system} />}
+      {project.system && (
+        <GeneratedSystemPanel
+          system={project.system}
+          backendUrl={backendUrl}
+          onAssetResolved={(name, type, patch) => {
+            update((p) => ({
+              system: {
+                ...p.system,
+                assets: (p.system.assets || []).map((a) =>
+                  a.name === name && a.type === type ? { ...a, ...patch } : a
+                ),
+              },
+            }));
+          }}
+        />
+      )}
 
       {project.system && (
         <div className="card" style={{ padding: 16, marginTop: 18 }}>
@@ -1048,7 +1235,7 @@ function EmptyBuilder({ prompt, setPrompt, onCreate }) {
   );
 }
 
-function GeneratedSystemPanel({ system }) {
+function GeneratedSystemPanel({ system, backendUrl, onAssetResolved }) {
   return (
     <div className="card" style={{ padding: 18 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
@@ -1069,6 +1256,16 @@ function GeneratedSystemPanel({ system }) {
           </div>
         </div>
       )}
+      {system.assets?.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: .4, marginBottom: 6 }}>ASSET MANIFEST</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {system.assets.map((a, i) => (
+              <AssetRow key={i} asset={a} backendUrl={backendUrl} onResolved={(patch) => onAssetResolved && onAssetResolved(a.name, a.type, patch)} />
+            ))}
+          </div>
+        </div>
+      )}
       {(system.vfx?.length > 0 || system.sfx?.length > 0 || system.animations?.length > 0) && (
         <div style={{ display: "flex", gap: 20, marginTop: 14, flexWrap: "wrap" }}>
           {system.vfx?.length > 0 && <MiniList title="VFX" items={system.vfx} />}
@@ -1084,6 +1281,107 @@ function GeneratedSystemPanel({ system }) {
         </div>
       )}
       {system.warnings?.length > 0 && <MiniList title="WARNINGS" items={system.warnings} tone="warn" />}
+    </div>
+  );
+}
+
+function AssetRow({ asset, backendUrl, onResolved }) {
+  const [searching, setSearching] = useState(false);
+  const [result, setResult] = useState(null); // resolution response (candidates, providersChecked, etc.)
+  const [expanded, setExpanded] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const cfg = {
+    VERIFIED: { icon: "✅", color: "var(--success)", label: "Vérifié" },
+    FOUND_UNVERIFIED: { icon: "🔎", color: "var(--ember2)", label: "Trouvé, non vérifié" },
+    PROCEDURAL: { icon: "🔧", color: "var(--violet)", label: "Procédural (aucun asset requis)" },
+    OPTIONAL_MISSING: { icon: "➖", color: "var(--muted)", label: "Facultatif absent" },
+    MISSING_ASSET: { icon: "⚠️", color: "var(--ember2)", label: "Asset manquant" },
+    INVALID: { icon: "❌", color: "var(--danger)", label: "Invalide" },
+  }[asset.status] || { icon: "❔", color: "var(--muted)", label: asset.status || "Inconnu" };
+
+  const canSearch = asset.status === "MISSING_ASSET" || asset.status === "OPTIONAL_MISSING";
+
+  async function doSearch() {
+    if (!backendUrl) { setErr("Configure d'abord l'URL du backend (page Roblox Studio)."); return; }
+    setSearching(true); setErr(null);
+    try {
+      const r = await backendResolveAsset(backendUrl, { name: asset.name, type: asset.type, searchTerm: asset.name });
+      setResult(r);
+      setExpanded(true);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  const [justUsed, setJustUsed] = useState(null);
+
+  function useCandidate(c) {
+    onResolved && onResolved({ status: c.status, assetId: c.assetId, source: c.source, sourceUrl: c.sourceUrl, license: c.license });
+    setJustUsed(c);
+    setExpanded(false);
+  }
+
+  return (
+    <div style={{ borderRadius: 8, background: "var(--surface2)", overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5, padding: "6px 10px" }}>
+        <span>{cfg.icon}</span>
+        <span style={{ fontWeight: 600 }}>{asset.name}</span>
+        <span className="tag" style={{ fontSize: 10 }}>{asset.type}</span>
+        <span style={{ color: cfg.color, marginLeft: "auto", fontSize: 11.5 }}>{cfg.label}</span>
+        {asset.assetId && <span className="fmono" style={{ fontSize: 10.5, color: "var(--muted)" }}>{asset.assetId}</span>}
+        {asset.sourceUrl && (
+          <a href={asset.sourceUrl} target="_blank" rel="noreferrer" style={{ color: "var(--violet)", fontSize: 10.5 }}>source</a>
+        )}
+        {canSearch && (
+          <button
+            onClick={doSearch}
+            disabled={searching}
+            className="btn-ghost"
+            style={{ padding: "3px 8px", borderRadius: 6, fontSize: 10.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}
+          >
+            {searching ? <Loader2 size={11} className="spin" /> : "🔍"} Search
+          </button>
+        )}
+        {result && (
+          <button onClick={() => setExpanded((e) => !e)} className="btn-ghost" style={{ padding: "3px 6px", borderRadius: 6, fontSize: 10.5, cursor: "pointer" }}>
+            {expanded ? "▲" : "▼"}
+          </button>
+        )}
+      </div>
+
+      {err && <div style={{ padding: "0 10px 8px", fontSize: 11, color: "var(--danger)" }}>{err}</div>}
+
+      {justUsed && (
+        <div style={{ padding: "0 10px 8px", fontSize: 11, color: "var(--muted)", lineHeight: 1.6 }}>
+          Manifeste mis à jour ({justUsed.status}, non injecté automatiquement dans le code par sécurité — pas de correspondance
+          garantie champ-par-champ). Va dans le chat et demande : <span className="fmono">"Utilise l'ID {justUsed.assetId || "trouvé"} pour {asset.name}"</span> pour l'appliquer réellement au fichier concerné.
+        </div>
+      )}
+
+      {expanded && result && (
+        <div style={{ padding: "0 10px 10px", borderTop: "1px solid var(--border)", marginTop: 2, paddingTop: 8 }}>
+          <div style={{ fontSize: 10.5, color: "var(--muted)", marginBottom: 6 }}>
+            Providers consultés : {result.providersChecked?.map((p) => `${p.provider}${p.available ? "" : " (indisponible)"}`).join(", ") || "—"}
+          </div>
+          {result.candidates?.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {result.candidates.map((c, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11.5, padding: "5px 8px", background: "var(--surface)", borderRadius: 6 }}>
+                  <span style={{ flex: 1 }}>{c.name} <span style={{ color: "var(--muted)" }}>· {c.source}</span></span>
+                  {c.assetId && <span className="fmono" style={{ fontSize: 10, color: "var(--muted)" }}>{c.assetId}</span>}
+                  {c.sourceUrl && <a href={c.sourceUrl} target="_blank" rel="noreferrer" style={{ fontSize: 10, color: "var(--violet)" }}>voir</a>}
+                  <button onClick={() => useCandidate(c)} className="btn-ember" style={{ padding: "3px 8px", borderRadius: 5, fontSize: 10, cursor: "pointer" }}>Utiliser</button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ fontSize: 11, color: "var(--muted)" }}>Aucun candidat trouvé — reste MISSING_ASSET. {result.rawSummary}</div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1410,6 +1708,12 @@ local function resolveContainer(path)
     for i = 2, #segments do current = getOrCreateFolder(current, segments[i]) end
     return current
 end
+local function hasPlaceholderAsset(text)
+    if type(text) ~= "string" then return false end
+    return text:find("YOUR_ASSET_ID_HERE") ~= nil
+        or text:find("YOUR_ANIMATION_ID_HERE") ~= nil
+        or text:find("rbxassetid://0000000000") ~= nil
+end
 local function createOrUpdateInstance(file)
     if not file.path or not file.type or not file.name then error("Descripteur de fichier invalide") end
     local container = resolveContainer(file.path)
@@ -1430,7 +1734,12 @@ local function createOrUpdateInstance(file)
     if SCRIPT_TYPES[file.type] then
         local content = file.code
         if content == nil then content = file.source end
-        if content ~= nil then inst.Source = content end
+        if content ~= nil then
+            inst.Source = content
+            if hasPlaceholderAsset(content) then
+                warn(string.format("[Forge AI] '%s' contient un Asset ID placeholder — ce build aurait dû être bloqué par le backend.", file.name))
+            end
+        end
     end
     if VALUE_TYPES[file.type] and file.value ~= nil then pcall(function() inst.Value = file.value end) end
     if file.properties then
@@ -1742,15 +2051,16 @@ function SettingsView({ showToast, backendUrl, setBackendUrl }) {
       <div className="card" style={{ padding: 18, marginBottom: 14 }}>
         <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>AI Provider</div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          <Field label="AI_PROVIDER" value="anthropic" />
-          <Field label="AI_MODEL" value={MODEL} />
-          <Field label="AI_MAX_BUDGET" value="1.0" />
-          <Field label="AI_MAX_OUTPUT_TOKENS" value="1000 (fixé par cet environnement)" />
+          <Field label="AI_PROVIDER" value="google (gemini)" />
+          <Field label="AI_MODEL" value="piloté par GEMINI_MODEL sur le backend" />
+          <Field label="AI_MAX_OUTPUT_TOKENS" value={String(4096)} />
+          <Field label="AI_MAX_BUDGET" value="dépend de ton quota Gemini" />
         </div>
         <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 12, lineHeight: 1.6 }}>
-          Dans cet artefact, le modèle et la limite de tokens de sortie sont fixés par l'environnement Claude
-          (max_tokens = 1000 par appel). C'est pourquoi Forge AI génère par étapes courtes plutôt qu'en un seul
-          appel géant.
+          La génération passe par ton propre backend (<code className="fmono">/api/generate</code>), qui appelle
+          l'API Gemini avec ta clé <code className="fmono">GEMINI_API_KEY</code>. Le nom exact du modèle Gemini
+          utilisé se configure côté backend via la variable d'environnement <code className="fmono">GEMINI_MODEL</code>
+          (Render → Environment), pas ici.
         </div>
       </div>
 
