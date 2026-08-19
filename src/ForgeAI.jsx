@@ -385,6 +385,20 @@ async function backendResolveAsset(backendUrl, { name, type, searchTerm, descrip
   return res.json();
 }
 
+// Phase 2 — Quality Decision Engine. Consumes the current Asset Manifest
+// as-is (whatever Phase 1 already resolved) — does not trigger any new
+// search. Returns REUSE/MODIFY/GENERATE/PROCEDURAL/OPTIONAL_MISSING/
+// BLOCK_BUILD per asset with scores and a reason.
+async function backendDecideQuality(backendUrl, assets, onRetry) {
+  const base = normalizeBackend(backendUrl);
+  const res = await fetchBackend(`${base}/quality/decide`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ assets }),
+  }, { onRetry });
+  return res.json();
+}
+
 // Real diagnostic: hits /api/health and classifies the failure precisely —
 // HTTP error vs network error vs (if applicable) CSP block — instead of
 // guessing. Returns a structured result the UI renders honestly.
@@ -1236,6 +1250,25 @@ function EmptyBuilder({ prompt, setPrompt, onCreate }) {
 }
 
 function GeneratedSystemPanel({ system, backendUrl, onAssetResolved }) {
+  const [decisions, setDecisions] = useState(null); // Map name::type -> decision object
+  const [evaluating, setEvaluating] = useState(false);
+  const [evalError, setEvalError] = useState(null);
+
+  async function evaluateQuality() {
+    if (!backendUrl || !system.assets?.length) return;
+    setEvaluating(true); setEvalError(null);
+    try {
+      const r = await backendDecideQuality(backendUrl, system.assets);
+      const map = {};
+      (r.decisions || []).forEach((d) => { map[`${d.asset_name}::${d.asset_type}`] = d; });
+      setDecisions(map);
+    } catch (e) {
+      setEvalError(e.message);
+    } finally {
+      setEvaluating(false);
+    }
+  }
+
   return (
     <div className="card" style={{ padding: 18 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
@@ -1258,10 +1291,28 @@ function GeneratedSystemPanel({ system, backendUrl, onAssetResolved }) {
       )}
       {system.assets?.length > 0 && (
         <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: .4, marginBottom: 6 }}>ASSET MANIFEST</div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+            <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: .4 }}>ASSET MANIFEST</div>
+            <button
+              onClick={evaluateQuality}
+              disabled={evaluating || !backendUrl}
+              className="btn-ghost"
+              style={{ padding: "4px 10px", borderRadius: 7, fontSize: 10.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 5, opacity: !backendUrl ? .5 : 1 }}
+              title={!backendUrl ? "Configure d'abord l'URL du backend" : "Décider REUSE/MODIFY/GENERATE/PROCEDURAL pour chaque asset"}
+            >
+              {evaluating ? <Loader2 size={11} className="spin" /> : "🧪"} Évaluer la stratégie
+            </button>
+          </div>
+          {evalError && <div style={{ fontSize: 11, color: "var(--danger)", marginBottom: 6 }}>{evalError}</div>}
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {system.assets.map((a, i) => (
-              <AssetRow key={i} asset={a} backendUrl={backendUrl} onResolved={(patch) => onAssetResolved && onAssetResolved(a.name, a.type, patch)} />
+              <AssetRow
+                key={i}
+                asset={a}
+                backendUrl={backendUrl}
+                onResolved={(patch) => onAssetResolved && onAssetResolved(a.name, a.type, patch)}
+                decision={decisions ? decisions[`${a.name}::${a.type}`] : null}
+              />
             ))}
           </div>
         </div>
@@ -1285,10 +1336,11 @@ function GeneratedSystemPanel({ system, backendUrl, onAssetResolved }) {
   );
 }
 
-function AssetRow({ asset, backendUrl, onResolved }) {
+function AssetRow({ asset, backendUrl, onResolved, decision }) {
   const [searching, setSearching] = useState(false);
   const [result, setResult] = useState(null); // resolution response (candidates, providersChecked, etc.)
   const [expanded, setExpanded] = useState(false);
+  const [decisionExpanded, setDecisionExpanded] = useState(false);
   const [err, setErr] = useState(null);
 
   const cfg = {
@@ -1299,6 +1351,15 @@ function AssetRow({ asset, backendUrl, onResolved }) {
     MISSING_ASSET: { icon: "⚠️", color: "var(--ember2)", label: "Asset manquant" },
     INVALID: { icon: "❌", color: "var(--danger)", label: "Invalide" },
   }[asset.status] || { icon: "❔", color: "var(--muted)", label: asset.status || "Inconnu" };
+
+  const decisionCfg = {
+    REUSE: { color: "var(--success)", bg: "rgba(61,220,151,.12)" },
+    MODIFY: { color: "var(--ember2)", bg: "rgba(255,179,71,.12)" },
+    GENERATE: { color: "var(--violet)", bg: "rgba(139,124,255,.12)" },
+    PROCEDURAL: { color: "var(--violet)", bg: "rgba(139,124,255,.12)" },
+    OPTIONAL_MISSING: { color: "var(--muted)", bg: "rgba(138,147,163,.10)" },
+    BLOCK_BUILD: { color: "var(--danger)", bg: "rgba(255,92,108,.14)" },
+  };
 
   const canSearch = asset.status === "MISSING_ASSET" || asset.status === "OPTIONAL_MISSING";
 
@@ -1335,6 +1396,19 @@ function AssetRow({ asset, backendUrl, onResolved }) {
         {asset.sourceUrl && (
           <a href={asset.sourceUrl} target="_blank" rel="noreferrer" style={{ color: "var(--violet)", fontSize: 10.5 }}>source</a>
         )}
+        {decision && (
+          <span
+            onClick={() => setDecisionExpanded((e) => !e)}
+            style={{
+              padding: "2px 8px", borderRadius: 999, fontSize: 10, fontWeight: 700, cursor: "pointer",
+              color: (decisionCfg[decision.decision] || {}).color || "var(--muted)",
+              background: (decisionCfg[decision.decision] || {}).bg || "transparent",
+            }}
+            title={`Priorité : ${decision.priority}`}
+          >
+            {decision.decision}
+          </span>
+        )}
         {canSearch && (
           <button
             onClick={doSearch}
@@ -1351,6 +1425,18 @@ function AssetRow({ asset, backendUrl, onResolved }) {
           </button>
         )}
       </div>
+
+      {decisionExpanded && decision && (
+        <div style={{ padding: "0 10px 10px", fontSize: 11, color: "var(--muted)", lineHeight: 1.6 }}>
+          <div>{decision.reason}</div>
+          <div style={{ marginTop: 4, display: "flex", gap: 12, flexWrap: "wrap" }}>
+            <span>Qualité: {decision.quality_score}</span>
+            <span>Compatibilité: {decision.compatibility_score}</span>
+            <span>Fit visuel: {decision.visual_fit_score}</span>
+            <span>Fit fonctionnel: {decision.functional_fit_score}</span>
+          </div>
+        </div>
+      )}
 
       {err && <div style={{ padding: "0 10px 8px", fontSize: 11, color: "var(--danger)" }}>{err}</div>}
 
