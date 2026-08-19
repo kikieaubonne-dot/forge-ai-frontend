@@ -873,11 +873,22 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
     }
     setBlockedAssets(null);
 
+    // Fail fast with a specific message instead of letting an invalid
+    // payload round-trip to the backend and come back as a generic 400.
+    if (!project.connectionCode) {
+      showToast("🔴 Envoi bloqué : ce projet n'a pas de code de connexion (donnée ancienne/corrompue). Recrée le projet.", "error");
+      return;
+    }
+    const systemName = project.system.system_name || project.name || "Système Forge AI";
+    if (!project.system.system_name) {
+      console.warn("[Forge AI] system_name manquant dans project.system — fallback appliqué:", systemName);
+    }
+
     setSending(true);
     setBuildResult(null);
     try {
       const r = await backendSendBuild(
-        backendUrl, project.connectionCode, project.system.system_name, project.system.files, project.id,
+        backendUrl, project.connectionCode, systemName, project.system.files, project.id,
         (attempt, total, reason) => showToast(`Réveil du backend... tentative ${attempt}/${total} (${reason})`)
       );
       const fileCount = project.system.files.length;
