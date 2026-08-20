@@ -108,12 +108,23 @@ function findPlaceholderIssues(files) {
   return issues;
 }
 
+// Same check the backend enforces (path/name/type required per file) — run
+// this right after every generation step, not just before Send to Studio,
+// so a malformed file shows up in Validation immediately instead of only
+// surfacing as a mysterious 400 later.
+function findMalformedFiles(files) {
+  return (files || [])
+    .map((f, i) => ({ index: i, name: f?.name || "(sans nom)", path: f?.path || "?", missing: ["path", "name", "type"].filter((k) => !f || !f[k]) }))
+    .filter((f) => f.missing.length > 0);
+}
+
 const SYSTEM_PROMPT = `Tu es le moteur de génération de FORGE AI, un copilote de développement Roblox Studio spécialisé en Luau.
 
 RÈGLES STRICTES :
 - Le code doit être compilable dans Roblox Studio (Luau), propre, commenté, modulaire.
 - JAMAIS de dégâts, cooldowns critiques ou récompenses validés uniquement côté client : la logique sensible vit dans ServerScriptService et est validée serveur.
 - GESTION DES ASSETS (animations, sons, meshes, textures) — INTERDICTION ABSOLUE d'écrire un Asset ID inventé OU un texte placeholder (comme "YOUR_ASSET_ID_HERE") dans le champ "code" ou dans "properties" d'un fichier. Ni faux ID, ni texte qui y ressemble.
+- CHAQUE fichier dans "files"/"new_files" DOIT obligatoirement inclure les trois champs "path", "name" ET "type" (Script|LocalScript|ModuleScript|Folder|RemoteEvent|RemoteFunction) — un fichier sans l'un de ces trois champs est rejeté et casse l'envoi vers Roblox Studio. Ne les omets jamais, même pour un fichier de configuration simple.
   - Si l'élément peut être créé procéduralement avec des Instances Roblox natives (ParticleEmitter, Beam, Trail, Attachment, Highlight, PointLight) : crée-le directement, sans aucun ID externe requis, et déclare-le dans "assets" avec status "PROCEDURAL" et assetId null.
   - Si l'élément nécessite un vrai Asset ID externe (son, AnimationId, mesh, texture) que tu n'as pas et ne peux pas vérifier : NE WRITE AUCUNE valeur dans le champ d'ID de la propriété (laisse-la absente ou chaîne vide ""), et déclare l'asset dans "assets" avec status "MISSING_ASSET", assetId null. Le code doit quand même créer l'Instance (Sound, Animation, etc.) — juste sans ID injecté.
   - N'attribue JAMAIS toi-même le statut "VERIFIED" ou "FOUND_UNVERIFIED" : tu n'as pas de moyen de vérifier un asset réel dans cet environnement. Utilise uniquement "PROCEDURAL", "MISSING_ASSET", ou "OPTIONAL_MISSING" (pour un élément cosmétique facultatif absent).
@@ -311,9 +322,10 @@ async function fetchBackend(url, options = {}, { retries = 2, onRetry } = {}) {
         const text = await res.text().catch(() => "");
         let parsedBody = null;
         try { parsedBody = text ? JSON.parse(text) : null; } catch (_) {}
+        const backendMsg = parsedBody?.message || parsedBody?.error;
         const err = new Error(
-          parsedBody?.message
-            ? `${parsedBody.message}`
+          backendMsg
+            ? `${backendMsg}`
             : `Le backend a répondu avec une erreur HTTP ${res.status}${text ? ` — ${text.slice(0, 200)}` : ""}`
         );
         err.httpStatus = res.status;
@@ -871,6 +883,18 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
       showToast(`🔴 Envoi bloqué : ${placeholderIssues.length} référence(s) d'asset placeholder détectée(s). Corrige-les d'abord (voir détail ci-dessous).`, "error");
       return;
     }
+
+    // Same failure mode as the backend's own check (path/name/type required
+    // per file) — catch it client-side first so the error names the exact
+    // file instead of a bare 400 with nothing actionable.
+    const malformedFiles = project.system.files
+      .map((f, i) => ({ index: i, name: f?.name || "(sans nom)", missing: ["path", "name", "type"].filter((k) => !f || !f[k]) }))
+      .filter((f) => f.missing.length > 0);
+    if (malformedFiles.length) {
+      setBlockedAssets(malformedFiles.map((f) => ({ path: "?", name: f.name, field: `champs manquants: ${f.missing.join(", ")}` })));
+      showToast(`🔴 Envoi bloqué : ${malformedFiles.length} fichier(s) incomplet(s) (path/name/type manquant). Régénère l'étape concernée ou corrige via le chat.`, "error");
+      return;
+    }
     setBlockedAssets(null);
 
     // Fail fast with a specific message instead of letting an invalid
@@ -916,9 +940,11 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
       if (e.body?.code === "PLACEHOLDER_ASSET_ID" && Array.isArray(e.body.detail)) {
         setBlockedAssets(e.body.detail);
         showToast("🔴 Le backend a refusé le build : référence(s) d'asset placeholder détectée(s).", "error");
+      } else if (e.body?.code === "MALFORMED_FILE" && Array.isArray(e.body.detail)) {
+        setBlockedAssets(e.body.detail.map((d) => ({ path: `fichier #${d.index}`, name: d.name, field: `champs manquants: ${d.missing.join(", ")}` })));
+        showToast("🔴 Le backend a refusé le build : fichier(s) incomplet(s) (voir détail ci-dessous).", "error");
       } else {
-        const detail = e.httpStatus ? `HTTP ${e.httpStatus} — vérifie les logs Render` : e.message;
-        showToast(`Échec de l'envoi : ${detail}`, "error");
+        showToast(`Échec de l'envoi : ${e.message}`, "error");
       }
     } finally {
       setSending(false);
@@ -968,9 +994,13 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         content: `${analysisCtx}Demande : "${prompt}"\n\nGénère l'architecture Roblox de base et UN SEUL fichier Luau court (20-30 lignes max) mais réellement fonctionnel et prioritaire (le plus important pour cette mécanique). Commentaires brefs. Réponds STRICTEMENT avec ce schéma JSON, sans aucun texte autour, JSON complet et valide obligatoire :\n${schema}\n\nTu pourras ajouter d'autres fichiers ensuite via les étapes suivantes ou le chat. Rappel : jamais de faux Asset ID ni de texte placeholder dans "code".`,
       }]);
       const placeholderIssues = findPlaceholderIssues(result.files);
-      if (placeholderIssues.length) {
+      const malformedFiles = findMalformedFiles(result.files);
+      if (placeholderIssues.length || malformedFiles.length) {
         result.validation = {
-          errors: placeholderIssues.map((i) => `PLACEHOLDER_ASSET_ID: ${i.path}/${i.name} (${i.field}) contient une référence d'asset placeholder — corrige avant d'envoyer à Roblox Studio.`),
+          errors: [
+            ...placeholderIssues.map((i) => `PLACEHOLDER_ASSET_ID: ${i.path}/${i.name} (${i.field}) contient une référence d'asset placeholder — corrige avant d'envoyer à Roblox Studio.`),
+            ...malformedFiles.map((f) => `MALFORMED_FILE: ${f.name} — champ(s) manquant(s) : ${f.missing.join(", ")}. Corrige via le chat avant d'envoyer à Roblox Studio.`),
+          ],
           warnings: [], suggestions: [],
         };
       }
@@ -1016,14 +1046,16 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         // placeholder-looking asset references regardless of what the
         // model claims — this is what actually enforces the no-fake-ID rule.
         const placeholderIssues = findPlaceholderIssues(sys.files);
+        const malformedFiles = findMalformedFiles(sys.files);
         const llmErrors = result.errors || [];
         const llmWarnings = result.warnings || [];
         const llmSuggestions = result.suggestions || [];
-        if (llmErrors.length || llmWarnings.length || llmSuggestions.length || placeholderIssues.length) {
+        if (llmErrors.length || llmWarnings.length || llmSuggestions.length || placeholderIssues.length || malformedFiles.length) {
           sys.validation = {
             errors: [
               ...llmErrors,
               ...placeholderIssues.map((i) => `PLACEHOLDER_ASSET_ID: ${i.path}/${i.name} (${i.field}) contient une référence d'asset placeholder — corrige avant d'envoyer à Roblox Studio.`),
+              ...malformedFiles.map((f) => `MALFORMED_FILE: ${f.name} — champ(s) manquant(s) : ${f.missing.join(", ")}. Corrige via le chat avant d'envoyer à Roblox Studio.`),
             ],
             warnings: llmWarnings,
             suggestions: llmSuggestions,
@@ -1066,13 +1098,15 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         (result.new_files || []).forEach((nf) => files.push(nf));
 
         const placeholderIssues = findPlaceholderIssues(files);
+        const malformedFiles = findMalformedFiles(files);
         const sys = { ...p.system, files };
-        if (placeholderIssues.length) {
+        if (placeholderIssues.length || malformedFiles.length) {
           sys.validation = {
             ...(p.system.validation || { warnings: [], suggestions: [] }),
             errors: [
               ...((p.system.validation && p.system.validation.errors) || []),
               ...placeholderIssues.map((i) => `PLACEHOLDER_ASSET_ID: ${i.path}/${i.name} (${i.field}) contient une référence d'asset placeholder — corrige avant d'envoyer à Roblox Studio.`),
+              ...malformedFiles.map((f) => `MALFORMED_FILE: ${f.name} — champ(s) manquant(s) : ${f.missing.join(", ")}. Corrige via le chat avant d'envoyer à Roblox Studio.`),
             ],
           };
         }
@@ -1081,7 +1115,9 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
           system: sys,
           chat: [...(p.chat || []), {
             role: "assistant",
-            text: (result.reply || "Modifications appliquées.") + (placeholderIssues.length ? " ⚠️ Un Asset ID placeholder a été détecté et signalé dans la validation — corrige-le avant d'envoyer à Roblox Studio." : ""),
+            text: (result.reply || "Modifications appliquées.")
+              + (placeholderIssues.length ? " ⚠️ Un Asset ID placeholder a été détecté et signalé dans la validation — corrige-le avant d'envoyer à Roblox Studio." : "")
+              + (malformedFiles.length ? ` ⚠️ ${malformedFiles.length} fichier(s) incomplet(s) (champ manquant) — signalé dans la validation.` : ""),
             id: uid(),
           }],
         };
