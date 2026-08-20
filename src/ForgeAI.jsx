@@ -118,6 +118,25 @@ function findMalformedFiles(files) {
     .filter((f) => f.missing.length > 0);
 }
 
+// Composes a ready-to-send French correction request from whatever issues
+// were just detected, so the person doesn't have to write it themselves —
+// it's placed in the chat input, not auto-sent (they still click Send).
+function buildFixPrompt(malformedFiles, placeholderIssues) {
+  const parts = [];
+  if (malformedFiles?.length) {
+    parts.push(
+      `les fichiers ${malformedFiles.map((f) => `"${f.name}" (champ manquant : ${f.missing.join(", ")})`).join(", ")}`
+    );
+  }
+  if (placeholderIssues?.length) {
+    parts.push(
+      `les fichiers ${placeholderIssues.map((i) => `"${i.name}" (${i.field} contient un placeholder au lieu d'un vrai contenu)`).join(", ")}`
+    );
+  }
+  if (!parts.length) return "";
+  return `Corrige ${parts.join(" et ")}. Renvoie-les complets, avec tous les champs requis (path, name, type) et sans aucun Asset ID inventé.`;
+}
+
 const SYSTEM_PROMPT = `Tu es le moteur de génération de FORGE AI, un copilote de développement Roblox Studio spécialisé en Luau.
 
 RÈGLES STRICTES :
@@ -157,7 +176,7 @@ async function rawClaudeCall(messages) {
     throw new Error("Configure d'abord l'URL du backend dans Settings — la génération IA passe par ton backend (voir /server/routes/generate.js).");
   }
   const base = AI_BACKEND_URL.trim().replace(/\/+$/, "");
-  const res = await fetch(`${base}/generate`, {
+  const res = await fetchBackend(`${base}/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -165,11 +184,7 @@ async function rawClaudeCall(messages) {
       system: SYSTEM_PROMPT,
       messages,
     }),
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`API error ${res.status}: ${t.slice(0, 200)}`);
-  }
+  }); // benefits from fetchBackend's built-in retry on 429/502/503/504 (Gemini rate limits, Render cold start)
   const data = await res.json();
   const text = (data.content || [])
     .map((b) => (b.type === "text" ? b.text : ""))
@@ -313,10 +328,14 @@ async function fetchBackend(url, options = {}, { retries = 2, onRetry } = {}) {
       const res = await fetch(url, { ...options, credentials: "omit" });
       console.log(`[Forge AI] Response ${res.status} ${url}`);
       if (!res.ok) {
-        if ([502, 503, 504].includes(res.status) && attempt < retries) {
-          console.warn(`[Forge AI] HTTP ${res.status} — treating as cold start, retrying...`);
-          onRetry && onRetry(attempt + 1, retries, `HTTP ${res.status} (backend probablement en train de démarrer)`);
-          await new Promise((r) => setTimeout(r, 4000 * (attempt + 1)));
+        if ([429, 502, 503, 504].includes(res.status) && attempt < retries) {
+          const reason = res.status === 429
+            ? "HTTP 429 (limite de débit atteinte — quota Gemini/backend)"
+            : `HTTP ${res.status} (backend probablement en train de démarrer)`;
+          console.warn(`[Forge AI] HTTP ${res.status} — retrying...`);
+          onRetry && onRetry(attempt + 1, retries, reason);
+          const backoffMs = res.status === 429 ? 6000 * (attempt + 1) : 4000 * (attempt + 1);
+          await new Promise((r) => setTimeout(r, backoffMs));
           continue;
         }
         const text = await res.text().catch(() => "");
@@ -368,13 +387,13 @@ async function backendStatus(backendUrl, code, onRetry) {
   return res.json();
 }
 
-async function backendSendBuild(backendUrl, code, systemName, files, projectId, onRetry) {
+async function backendSendBuild(backendUrl, code, systemName, files, projectId, assets, onRetry) {
   const base = normalizeBackend(backendUrl);
   const url = `${base}/studio/build`;
   const res = await fetchBackend(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code, system_name: systemName, files, project_id: projectId }),
+    body: JSON.stringify({ code, system_name: systemName, files, project_id: projectId, assets: assets || [] }),
   }, { onRetry });
   return res.json();
 }
@@ -912,7 +931,7 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
     setBuildResult(null);
     try {
       const r = await backendSendBuild(
-        backendUrl, project.connectionCode, systemName, project.system.files, project.id,
+        backendUrl, project.connectionCode, systemName, project.system.files, project.id, project.system.assets || [],
         (attempt, total, reason) => showToast(`Réveil du backend... tentative ${attempt}/${total} (${reason})`)
       );
       const fileCount = project.system.files.length;
@@ -1003,6 +1022,7 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
           ],
           warnings: [], suggestions: [],
         };
+        setChatInput(buildFixPrompt(malformedFiles, placeholderIssues));
       }
       update((p) => ({
         system: result,
@@ -1034,6 +1054,10 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         content: `Système : "${project.system.system_name}". Demande initiale : "${prompt}". Fichiers existants : ${filesSummary}.\n\n${instructions[stepKey]}\n\nSois extrêmement concis. Code réellement fonctionnel uniquement, JSON complet et valide. Rappel : jamais de faux Asset ID ni de texte placeholder dans "code" ou "properties".`,
       }]);
 
+      const combinedFiles = [...project.system.files, ...(result.new_files || [])];
+      const placeholderIssues = findPlaceholderIssues(combinedFiles);
+      const malformedFiles = findMalformedFiles(combinedFiles);
+
       update((p) => {
         const sys = { ...p.system };
         if (result.new_files) sys.files = [...sys.files, ...result.new_files];
@@ -1045,8 +1069,6 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         // Deterministic safety net: scan every file (old + new) for
         // placeholder-looking asset references regardless of what the
         // model claims — this is what actually enforces the no-fake-ID rule.
-        const placeholderIssues = findPlaceholderIssues(sys.files);
-        const malformedFiles = findMalformedFiles(sys.files);
         const llmErrors = result.errors || [];
         const llmWarnings = result.warnings || [];
         const llmSuggestions = result.suggestions || [];
@@ -1069,6 +1091,9 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
           versions: [...(p.versions || []), { id: uid(), label: `v${(p.versions?.length || 0) + 2} — ${STEP_DEFS.find(s => s.key === stepKey)?.label}`, system: sys, ts: Date.now() }],
         };
       });
+      if (placeholderIssues.length || malformedFiles.length) {
+        setChatInput(buildFixPrompt(malformedFiles, placeholderIssues));
+      }
       showToast(`${STEP_DEFS.find((s) => s.key === stepKey)?.label} terminé.`);
     } catch (e) {
       showToast(e.message, "error");
@@ -1089,6 +1114,15 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         role: "user",
         content: `Système actuel "${project.system.system_name}". Fichiers :\n${filesSummary}\n\nDemande de modification : "${userMsg}"\n\nModifie UNIQUEMENT ce qui est nécessaire, au maximum 1-2 fichiers courts. Réponds en JSON: {"reply": "explication courte en français", "updated_files": [{"path":"...","type":"...","name":"...","code":"..."}], "new_files": [{...}]}. "updated_files" remplace des fichiers existants (même path+name), "new_files" en ajoute. JSON complet et valide obligatoire.`,
       }]);
+      let mergedFiles = [...project.system.files];
+      (result.updated_files || []).forEach((uf) => {
+        const idx = mergedFiles.findIndex((f) => f.path === uf.path && f.name === uf.name);
+        if (idx >= 0) mergedFiles[idx] = uf; else mergedFiles.push(uf);
+      });
+      (result.new_files || []).forEach((nf) => mergedFiles.push(nf));
+      const placeholderIssues = findPlaceholderIssues(mergedFiles);
+      const malformedFiles = findMalformedFiles(mergedFiles);
+
       update((p) => {
         let files = [...p.system.files];
         (result.updated_files || []).forEach((uf) => {
@@ -1097,8 +1131,6 @@ function BuilderView({ project, focus, createProject, update, showToast, backend
         });
         (result.new_files || []).forEach((nf) => files.push(nf));
 
-        const placeholderIssues = findPlaceholderIssues(files);
-        const malformedFiles = findMalformedFiles(files);
         const sys = { ...p.system, files };
         if (placeholderIssues.length || malformedFiles.length) {
           sys.validation = {
